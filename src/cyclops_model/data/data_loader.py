@@ -1,0 +1,798 @@
+import ast
+import json
+import random
+from pathlib import Path
+from typing import Callable, List, Literal, Optional
+
+import zarr
+import numpy as np
+import pandas as pd
+import torch
+from iohub import open_ome_zarr
+from monai.transforms import (
+    CenterSpatialCropd,
+    Compose,
+    RandFlipd,
+    RandRotate90d,
+    SpatialPadd,
+    ToTensord,
+)
+
+from torch.utils.data import Dataset
+from viscy.transforms import (
+    RandAdjustContrastd,
+    RandAffined,
+    RandGaussianNoised,
+    RandScaleIntensityd,
+)
+
+from .paths import OpsPaths
+from .labels import filter_small_bboxes
+from .collate_utils import (
+    collate_basic_dataset,
+    collate_variable_size_cells,
+    create_contrastive_collate_fcn,
+)
+
+import warnings
+
+warnings.filterwarnings("ignore", category=zarr.errors.ZarrUserWarning)
+
+# Default name of the per-construct identifier column in adata.obs.
+# Override per experiment via OpsDataManager(guide_col=...) (e.g. a custom
+# perturbation column for non-CRISPR libraries).
+DEFAULT_GUIDE_COL = "sgRNA"
+
+
+class BaseDataset(Dataset):
+
+    def __init__(
+        self,
+        stores: dict,
+        labels_df: pd.DataFrame,
+        initial_yx_patch_size: tuple = (128, 128),
+        final_yx_patch_size: tuple = (128, 128),
+        out_channels: List[str] | Literal["random"] | Literal["all"] = "random",
+        label_int_lut: dict = None,  # string --> int
+        int_label_lut: dict = None,  # int --> string
+        cell_masks: bool = True,
+        dataloader_normalization: Literal["log", "per_well", "none"] = "log",
+        transform: Optional[Callable] = None,
+        guide_col: str = DEFAULT_GUIDE_COL,
+    ):
+        self.stores = stores
+        self.labels_df = labels_df
+        self.initial_yx_patch_size = initial_yx_patch_size
+        self.final_yx_patch_size = final_yx_patch_size
+        self.out_channels = out_channels
+        self.label_int_lut = label_int_lut
+        self.int_label_lut = int_label_lut
+        self.cell_masks = cell_masks
+        self.dataloader_normalization = dataloader_normalization
+        self.guide_col = guide_col
+        # Per-(store, well) cache of normalization_stats.json for "per_well" mode.
+        self._well_stats_cache: dict = {}
+
+        if transform is None:
+            self.transform = Compose(
+                [
+                    SpatialPadd(
+                        keys=["data", "mask"],
+                        spatial_size=self.initial_yx_patch_size,
+                    ),
+                    CenterSpatialCropd(
+                        keys=["data", "mask"], roi_size=(self.final_yx_patch_size)
+                    ),
+                    RandFlipd(
+                        # Vertical Flip
+                        keys=["data", "mask"],
+                        prob=0.5,
+                        spatial_axis=-2,
+                    ),
+                    RandFlipd(
+                        # Horizontal Flip
+                        keys=["data", "mask"],
+                        prob=0.5,
+                        spatial_axis=-1,
+                    ),
+                    RandRotate90d(
+                        keys=["data", "mask"],
+                        prob=0.5,
+                        max_k=3,
+                        spatial_axes=(-2, -1),
+                    ),
+                    ToTensord(
+                        keys=["data", "mask"],
+                    ),
+                ]
+            )
+        else:
+            self.transform = transform
+        return
+
+    def _normalize_data(self, channel_names, data):
+        img_list = []
+        for ch in channel_names:
+            img = data[channel_names.index(ch)]
+            if ch == "Phase2D" or ch == "Focus3D":
+                img_norm = img / np.std(img)
+                img_list.append(img_norm)
+            else:
+                # apply log normalization
+                img = np.clip(img, a_min=1e-8, a_max=None)
+                log_img = np.log1p(img)
+                img_norm = (log_img - log_img.mean()) / (log_img.std() + 1e-8)
+                img_list.append(img_norm)
+
+        data_norm = np.stack(img_list, axis=0)
+
+        return data_norm
+
+    def _load_well_stats(self, store_key, well):
+        """Load (and cache) the per-well normalization_stats.json for a store/well."""
+        cache_key = (store_key, well)
+        if cache_key not in self._well_stats_cache:
+            stats_path = (
+                Path(OpsPaths(store_key).stores["phenotyping_v3"])
+                / well
+                / "normalization_stats.json"
+            )
+            with open(stats_path) as f:
+                self._well_stats_cache[cache_key] = json.load(f)
+        return self._well_stats_cache[cache_key]
+
+    def _normalize_per_well(self, channel_index, data, store_key, well):
+        """Robust per-well normalization: (x - median) / iqr.
+
+        Uses whole-FOV raw-intensity stats (median/iqr per channel index) from
+        the well's normalization_stats.json. No log transform; pair with
+        model_z_score=False to preserve cell-level fluorescence intensity.
+        """
+        stats = self._load_well_stats(store_key, well)
+        img_list = []
+        for i, ch_idx in enumerate(channel_index):
+            ch_stats = stats["channels"][str(ch_idx)]["dataset_statistics"]
+            img_norm = (data[i] - ch_stats["median"]) / (ch_stats["iqr"] + 1e-8)
+            img_list.append(img_norm)
+        return np.stack(img_list, axis=0)
+
+    def _apply_normalization(self, channel_names, channel_index, data, store_key, well):
+        """Select the dataloader normalization strategy from config."""
+        if self.dataloader_normalization == "log":
+            return self._normalize_data(channel_names, data)
+        if self.dataloader_normalization == "per_well":
+            return self._normalize_per_well(channel_index, data, store_key, well)
+        if self.dataloader_normalization == "none":
+            return data
+        raise ValueError(
+            f"Unknown dataloader_normalization {self.dataloader_normalization!r}; "
+            "expected 'log', 'per_well', or 'none'"
+        )
+
+    def _pad_bbox(self, bbox, final_shape):
+        """
+        bbox: (ymin, xmin, ymax, xmax)
+        final_shape: (height, width)
+
+        If bbox is smaller than final_shape, pad it equally on all sides to reach final_shape.
+        """
+        if len(final_shape) > 2:
+            final_shape = final_shape[-2:]
+
+        ymin, xmin, ymax, xmax = bbox
+        target_height, target_width = final_shape
+
+        # Calculate current bbox dimensions
+        current_height = ymax - ymin
+        current_width = xmax - xmin
+
+        # Calculate padding needed
+        height_padding = max(0, target_height - current_height)
+        width_padding = max(0, target_width - current_width)
+
+        # Distribute padding equally on both sides
+        pad_top = height_padding / 2
+        pad_bottom = height_padding / 2
+        pad_left = width_padding / 2
+        pad_right = width_padding / 2
+
+        # Apply padding
+        new_ymin = int(ymin - pad_top)
+        new_ymax = int(ymax + pad_bottom)
+        new_xmin = int(xmin - pad_left)
+        new_xmax = int(xmax + pad_right)
+
+        return (new_ymin, new_xmin, new_ymax, new_xmax)
+
+    def _get_channels(self, ci, well):
+
+        attrs = self.stores[ci.store_key][well].attrs.asdict()
+        all_channel_names = [a["label"] for a in attrs["ome"]["omero"]["channels"]]
+
+        if self.out_channels == "random":
+            channel_names = [random.choice(all_channel_names)]
+        elif self.out_channels == "all":
+            channel_names = all_channel_names
+        else:
+            channel_names = self.out_channels
+        channel_index = [all_channel_names.index(c) for c in channel_names]
+
+        return channel_names, channel_index
+
+    def __len__(self):
+        return len(self.labels_df)
+
+    def __getitem__(self, index):
+        ci = self.labels_df.iloc[index]  # crop info
+
+        well = ci.well
+        fov = self.stores[ci.store_key][well]["0"]
+        mask_label = getattr(ci, "mask_label", "cell_seg")
+        mask_fov = self.stores[ci.store_key][well]["labels"][mask_label]["0"]
+        gene_label = self.label_int_lut[ci.gene_name]
+        total_index = ci.total_index
+        bbox = ast.literal_eval(ci.bbox)
+        if not self.cell_masks:
+            bbox = self._pad_bbox(bbox, self.initial_yx_patch_size)
+
+        channel_names, channel_index = self._get_channels(ci, well)
+
+        data = np.asarray(
+            fov[
+                0:1,
+                channel_index,
+                0:1,
+                slice(bbox[0], bbox[2]),
+                slice(bbox[1], bbox[3]),
+            ]
+        ).copy()
+        data = np.squeeze(data)
+        if len(data.shape) == 2:
+            data = np.expand_dims(data, axis=0)
+
+        mask = np.asarray(
+            mask_fov[0:1, :, 0:1, slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3])]
+        ).copy()
+        mask = np.squeeze(mask)
+        mask = np.expand_dims(mask, axis=0)
+        sc_mask = mask == ci.segmentation_id
+
+        data_norm = self._apply_normalization(
+            channel_names, channel_index, data, ci.store_key, well
+        )
+
+        if self.cell_masks:
+            data_norm = data_norm * sc_mask
+
+        if len(self.final_yx_patch_size) == 3:
+            data_norm = np.expand_dims(data_norm, axis=0)
+            sc_mask = np.expand_dims(sc_mask, axis=0)
+
+        batch = {
+            "data": data_norm.astype(np.float32),
+            "mask": sc_mask,
+            "gene_label": gene_label,
+            "marker_label": channel_names,
+            "total_index": total_index,
+            "crop_info": ci.to_dict(),
+        }
+
+        batch = self.transform(batch)
+
+        return batch
+
+
+class ContrastiveDataset(BaseDataset):
+    def __init__(
+        self,
+        transform=None,
+        positive_source: str | Literal["self"] | Literal["perturbation"] = "self",
+        use_negative: bool = False,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.positive_source = positive_source
+        self.use_negative = use_negative
+        if transform is None:
+            self.transform = Compose(
+                [
+                    SpatialPadd(
+                        keys=["data"],
+                        spatial_size=self.initial_yx_patch_size,
+                    ),
+                    RandFlipd(
+                        # horizontal flip
+                        keys=["data"],
+                        prob=0.5,
+                        spatial_axis=-1,
+                    ),
+                    RandFlipd(
+                        # vertical flip
+                        keys=["data"],
+                        prob=0.5,
+                        spatial_axis=-2,
+                    ),
+                    RandAffined(
+                        keys=["data"],
+                        prob=0.8,
+                        rotate_range=(3.14, 0),
+                        scale_range=(0.2, 0.2),
+                        shear_range=(0, 0),
+                        padding_mode="zeros",
+                    ),
+                    RandAdjustContrastd(
+                        keys=["data"],
+                        prob=0.5,
+                        gamma=[0.8, 1.2],
+                    ),
+                    RandScaleIntensityd(keys=["data"], prob=0.5, factors=0.5),
+                    RandGaussianNoised(keys=["data"], prob=0.5, mean=0.0, std=0.05),
+                    CenterSpatialCropd(
+                        keys=["data"],
+                        roi_size=(self.final_yx_patch_size),
+                    ),
+                    ToTensord(
+                        keys=["data"],
+                    ),
+                ]
+            )
+        else:
+            self.transform = transform
+        return
+
+    def get_crop(self, index):
+        ci = self.labels_df.iloc[index]  # crop info
+
+        well = ci.well
+        fov = self.stores[ci.store_key][well]["0"]
+        mask_label = getattr(ci, "mask_label", "cell_seg")
+        mask_fov = self.stores[ci.store_key][well]["labels"][mask_label]["0"]
+        gene_label = self.label_int_lut[ci.gene_name]
+        total_index = ci.total_index
+        bbox = ast.literal_eval(ci.bbox)
+        if not self.cell_masks:
+            bbox = self._pad_bbox(bbox, self.initial_yx_patch_size)
+
+        channel_names, channel_index = self._get_channels(ci, well)
+
+        data = np.asarray(
+            fov[
+                0:1,
+                channel_index,
+                0:1,
+                slice(bbox[0], bbox[2]),
+                slice(bbox[1], bbox[3]),
+            ]
+        ).copy()
+        data = np.squeeze(data)
+        if len(data.shape) == 2:
+            data = np.expand_dims(data, axis=0)
+
+        mask = np.asarray(
+            mask_fov[0:1, :, 0:1, slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3])]
+        ).copy()
+        mask = np.squeeze(mask)
+        mask = np.expand_dims(mask, axis=0)
+        sc_mask = mask == ci.segmentation_id
+
+        data_norm = self._apply_normalization(
+            channel_names, channel_index, data, ci.store_key, well
+        )
+
+        if self.cell_masks:
+            data_norm = data_norm * sc_mask
+
+        if len(self.final_yx_patch_size) == 3:
+            data_norm = np.expand_dims(data_norm, axis=0)
+            sc_mask = np.expand_dims(sc_mask, axis=0)
+
+        return data_norm, sc_mask, gene_label, channel_names, total_index, ci
+
+    def __getitem__(self, index):
+        anchor_i = self.labels_df.iloc[index]
+        anchor_data, _, anchor_gene_label, channel_names, _, _ = self.get_crop(index)
+
+        if self.positive_source == "self":
+            positive_data = anchor_data.copy()
+            positive_gene_label = anchor_gene_label
+            positive_i = anchor_i
+
+        if self.positive_source == "perturbation":
+            positive_rows = np.flatnonzero(
+                self.labels_df["gene_name"].values == anchor_i["gene_name"]
+            )
+            positive_indx = np.random.choice(positive_rows)
+            positive_data, _, positive_gene_label, _, _, positive_i = self.get_crop(
+                positive_indx
+            )
+
+        batch = {
+            "anchor": anchor_data.astype(np.float32),
+            "positive": positive_data.astype(np.float32),
+            "gene_label": {
+                "anchor": anchor_gene_label,
+                "positive": positive_gene_label,
+            },
+            "marker_label": channel_names,
+            "crop_info": {
+                "anchor": anchor_i.to_dict(),
+                "positive": positive_i.to_dict(),
+            },
+        }
+
+        if self.use_negative:
+            negative_rows = np.flatnonzero(
+                self.labels_df["gene_name"].values != anchor_i["gene_name"]
+            )
+            negative_indx = np.random.choice(negative_rows)
+
+            negative_data, _, negative_gene_label, _, _, negative_i = self.get_crop(
+                negative_indx
+            )
+
+            batch["negative"] = negative_data.astype(np.float32)
+            batch["gene_label"]["negative"] = negative_gene_label
+            batch["crop_info"]["negative"] = negative_i.to_dict()
+
+        if self.transform is not None:
+            for k, v in batch.items():
+                if k in ["gene_label", "marker_label", "crop_info"]:
+                    continue
+                mini_batch = {"data": v}
+                mini_batch_trans = self.transform(mini_batch)
+                batch[k] = mini_batch_trans["data"]
+
+        return batch
+
+
+class CellProfileDataset(BaseDataset):
+    def __init__(self, stores: dict, labels_df: pd.DataFrame, **kwargs):
+        super().__init__(stores, labels_df, **kwargs)
+
+    def __getitem__(self, index):
+
+        ci = self.labels_df.iloc[index]  # crop info
+
+        well = ci.well
+        fov = self.stores[ci.store_key][well]["0"]
+        mask_label = getattr(ci, "mask_label", "cell_seg")
+        cell_mask_fov = self.stores[ci.store_key][well]["labels"][mask_label]["0"]
+        nuc_mask_fov = self.stores[ci.store_key][well]["labels"]["nuclear_seg"]["0"]
+        bbox = ast.literal_eval(ci.bbox)
+        gene_label = self.label_int_lut[ci.gene_name]
+        total_index = ci.total_index
+
+        channel_names, channel_index = self._get_channels(ci, well)
+
+        data = np.asarray(
+            fov[
+                0:1,
+                channel_index,
+                0:1,
+                slice(bbox[0], bbox[2]),
+                slice(bbox[1], bbox[3]),
+            ]
+        ).copy()
+        data = np.squeeze(data)
+        if len(data.shape) == 2:
+            data = np.expand_dims(data, axis=0)
+
+        cell_mask = np.asarray(
+            cell_mask_fov[0:1, :, 0:1, slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3])]
+        ).copy()
+        cell_mask = np.squeeze(cell_mask)
+        cell_mask = np.expand_dims(cell_mask, axis=0)
+        nuc_mask = np.asarray(
+            nuc_mask_fov[0:1, :, 0:1, slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3])]
+        ).copy()
+        nuc_mask = np.squeeze(nuc_mask)
+        nuc_mask = np.expand_dims(nuc_mask, axis=0)
+        sc_mask = cell_mask == ci.segmentation_id
+
+        # cell_seg and nuclear_seg zarr arrays can differ by a few pixels at FOV
+        # boundaries due to independent segmentation pipelines. Clip to the smaller
+        # extent so downstream mask multiplication doesn't broadcast-error.
+        min_h = min(nuc_mask.shape[1], sc_mask.shape[1])
+        min_w = min(nuc_mask.shape[2], sc_mask.shape[2])
+        nuc_mask = nuc_mask[:, :min_h, :min_w]
+        sc_mask = sc_mask[:, :min_h, :min_w]
+
+        # ensure that all output masks as binary
+        if self.cell_masks:
+            data = data[:, :min_h, :min_w]
+            nuc_mask = (nuc_mask * sc_mask) > 0
+
+        cyto_mask = sc_mask & (nuc_mask == 0)
+
+        batch = {
+            "data": data,
+            "cell_mask": sc_mask,
+            "gene_label": gene_label,
+            "cyto_mask": cyto_mask,
+            "nuc_mask": nuc_mask,
+            "marker_label": channel_names,
+            "total_index": total_index,
+            "crop_info": ci.to_dict(),
+        }
+
+        return batch
+
+
+class OpsDataManager:
+    def __init__(
+        self,
+        experiments: dict,
+        data_split: tuple = (0.9, 0.05, 0.05),
+        shuffle_seed: int = 1,
+        initial_yx_patch_size: tuple = (200, 200),
+        final_yx_patch_size: tuple = (128, 128),
+        batch_size: int = 32,
+        out_channels: List[str] | Literal["random"] = "random",
+        verbose: bool = False,
+        link_csv_dir: str | None = None,
+        guide_col: str = DEFAULT_GUIDE_COL,
+        store_key: str = "phenotyping_v3",
+    ):
+        self.experiments = experiments
+        self.store_key = store_key
+        self.data_split = data_split
+        self.shuffle_seed = shuffle_seed
+        self.num_workers = 1
+        self.initial_yx_patch_size = initial_yx_patch_size
+        self.final_yx_patch_size = final_yx_patch_size
+        self.batch_size = batch_size
+        self.out_channels = out_channels
+        self.verbose = verbose
+        self.collate_fcn = None
+        self.link_csv_dir = Path(link_csv_dir) if link_csv_dir is not None else None
+        if self.link_csv_dir is not None and len(self.experiments) > 1:
+            raise ValueError("link_csv_dir can only be used with a single experiment")
+        self.guide_col = guide_col
+
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
+
+    def split_data(self, labels_df):
+        """Splits data into train, val, and test sets"""
+        np.random.seed(self.shuffle_seed)
+        ind = np.random.choice(len(labels_df), size=len(labels_df), replace=False)
+        split_ind = list(
+            np.cumsum([int(len(labels_df) * i) for i in self.data_split[:-1]])
+        )
+        train_ind = ind[0 : split_ind[0]]
+        val_ind = ind[split_ind[0] : split_ind[1]]
+        test_ind = ind[split_ind[1] : len(labels_df)]
+
+        return train_ind, val_ind, test_ind
+
+    def get_labels(self):
+        """ """
+
+        labels = []
+        for exp_name, wells in self.experiments.items():
+
+            for w in wells:
+                if self.verbose:
+                    print("reading labels for", exp_name, f"links_{w[0]}{w[2]}")
+                if self.link_csv_dir is not None:
+                    well_prefix = w[0] + w[2]
+                    csv_path = self.link_csv_dir / f"{well_prefix}_linked_pheno_iss.csv"
+                else:
+                    # Default to the live 3-assembly CSV ("original") so feature
+                    # extractions automatically pick up ISS-pipeline re-runs.
+                    # The frozen "training" snapshot under models/link_csvs/ goes
+                    # stale whenever ISS is re-run (14-23% gene-call drift was
+                    # observed across 81/84 experiments). Pass explicit
+                    # link_csv_dir=models/link_csvs/<exp>/ if a frozen snapshot
+                    # is required for reproducible training.
+                    csv_path = OpsPaths(exp_name, well=w).links["original"]
+                print(f"Reading link CSV from {csv_path}")
+                labels_tmp = pd.read_csv(csv_path)
+
+                # Custom-perturbation back-compat: some link CSVs use a
+                # non-standard guide column (self.guide_col) and have no
+                # "gene_name" column. Copy the guide column into gene_name so
+                # downstream gene_name-aware code (balanced sampling, gene-label
+                # LUT helpers) keeps working.
+                if (
+                    "gene_name" not in labels_tmp.columns
+                    and "Gene name" not in labels_tmp.columns
+                    and self.guide_col != "gene_name"
+                    and self.guide_col in labels_tmp.columns
+                ):
+                    labels_tmp["gene_name"] = labels_tmp[self.guide_col]
+
+                if self.guide_col not in labels_tmp.columns:
+                    raise ValueError(
+                        f"guide_col {self.guide_col!r} not in link CSV "
+                        f"{csv_path}. Available columns: "
+                        f"{list(labels_tmp.columns)}"
+                    )
+
+                # remove rows with NaN segmentation_id
+                labels_tmp = labels_tmp.dropna(subset=["segmentation_id"])
+
+                # remove cells with suspiciously small bounding boxes
+                labels_tmp, num_rem = filter_small_bboxes(labels_tmp, threshold=5)
+                if self.verbose:
+                    print(
+                        f"Removed {num_rem} cells with small bounding boxes from {exp_name} {w[0]}{w[2]}"
+                    )
+                labels_tmp["store_key"] = exp_name
+                labels_tmp["well"] = w
+                if self.verbose:
+                    print(f"{exp_name} {w[0]}{w[2]}: {len(labels_tmp)} cells")
+                labels.append(labels_tmp)
+        labels_df = pd.concat(labels, ignore_index=True)
+        if "Gene name" in labels_df.columns:
+            labels_df["gene_name"] = labels_df["Gene name"].fillna("NTC")
+        elif "gene_name" in labels_df.columns:
+            labels_df["gene_name"] = labels_df["gene_name"].fillna("NTC")
+        else:
+            raise ValueError("No gene name column found in labels file")
+        labels_df["total_index"] = np.arange(len(labels_df))  # add index column
+        if self.verbose:
+            print(f"Total cells: {len(labels_df)}")
+
+        return labels_df
+
+    def gene_label_converter(self):
+        """ """
+        gene_labels = sorted(self.labels_df["gene_name"].unique())
+        label_int_lut = {gene: i for i, gene in enumerate(gene_labels)}
+        int_label_lut = {i: gene for i, gene in enumerate(gene_labels)}
+
+        return label_int_lut, int_label_lut
+
+    def combine_stores(self):
+        """ """
+        stores = {}
+        for exp_name, wells in self.experiments.items():
+            stores[f"{exp_name}"] = zarr.open_group(
+                OpsPaths(exp_name).stores[self.store_key], mode="r"
+            )
+
+        return stores
+
+    def balanced_sample_weights(self, df: pd.DataFrame):
+        """
+        Needs to be run on the individual train/val/test dataframes, becuase the
+        entries get shuffled during splitting.
+        """
+        class_counts = df["gene_name"].value_counts().to_dict()
+        class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
+        sample_weights = np.array(
+            [class_weights[gene_name] for gene_name in df["gene_name"]]
+        )
+
+        return sample_weights
+
+    def create_sampler(self, df: pd.DataFrame, balanced: bool):
+        if not balanced:
+            return None
+
+        sample_weights = self.balanced_sample_weights(df)
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),  # total samples per epoch
+            replacement=True,
+        )
+        return sampler
+
+    def construct_dataloaders(
+        self,
+        labels_df: pd.DataFrame = None,
+        num_workers: int = 1,
+        dataset_type: Literal["basic", "contrastive", "cell_profile"] = "basic",
+        balanced_sampling: bool = False,
+        contrastive_kwargs: dict = None,
+        basic_kwargs: dict = None,
+        cp_kwargs: dict = None,
+        train_loader_kwargs: dict = None,
+    ):
+        """
+        Returns train, val and test dataloaders
+        """
+
+        if labels_df is None:
+            labels_df = self.get_labels()
+        self.labels_df = labels_df
+        self.store_dict = self.combine_stores()
+        self.label_int_lut, self.int_label_lut = self.gene_label_converter()
+
+        train_ind, val_ind, test_ind = self.split_data(labels_df)
+
+        common_kwargs = {
+            "initial_yx_patch_size": self.initial_yx_patch_size,
+            "final_yx_patch_size": self.final_yx_patch_size,
+            "out_channels": self.out_channels,
+            "label_int_lut": self.label_int_lut,
+            "int_label_lut": self.int_label_lut,
+            "guide_col": self.guide_col,
+        }
+
+        if dataset_type == "basic":
+            DS = BaseDataset
+            dataset_kwargs = {**common_kwargs, **(basic_kwargs if basic_kwargs else {})}
+            self.collate_fcn = collate_basic_dataset
+
+        elif dataset_type == "cell_profile":
+            DS = CellProfileDataset
+            dataset_kwargs = {**common_kwargs, **(cp_kwargs if cp_kwargs else {})}
+            self.collate_fcn = (
+                collate_variable_size_cells  # Use custom collate for variable sizes
+            )
+        elif dataset_type == "contrastive":
+            DS = ContrastiveDataset
+            dataset_kwargs = {
+                **common_kwargs,
+                **(contrastive_kwargs if contrastive_kwargs else {}),
+            }
+            self.collate_fcn = create_contrastive_collate_fcn(
+                use_negative=contrastive_kwargs.get("use_negative", False)
+            )
+        else:
+            raise ValueError(f"Unknown dataset_type: {dataset_type}")
+
+        if len(train_ind) > 0:
+            train_df = labels_df.iloc[train_ind]
+            train_sampler = self.create_sampler(train_df, balanced_sampling)
+            train_dataset = DS(
+                stores=self.store_dict,
+                labels_df=train_df,
+                **dataset_kwargs,
+            )
+            train_loader = torch.utils.data.DataLoader(
+                dataset=train_dataset,
+                batch_size=self.batch_size,
+                num_workers=num_workers,
+                collate_fn=self.collate_fcn,
+                sampler=train_sampler,
+                **(train_loader_kwargs if train_loader_kwargs else {}),
+            )
+
+            self.train_loader = train_loader
+
+        if len(val_ind) > 0:
+            val_df = labels_df.iloc[val_ind]
+            val_sampler = self.create_sampler(val_df, balanced_sampling)
+            val_dataset = DS(
+                stores=self.store_dict,
+                labels_df=val_df,
+                **dataset_kwargs,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                dataset=val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=self.collate_fcn,
+                sampler=val_sampler,
+            )
+
+            self.val_loader = val_loader
+
+        if len(test_ind) > 0:
+            test_df = labels_df.iloc[test_ind]
+            test_sampler = self.create_sampler(test_df, balanced_sampling)
+            test_dataset = DS(
+                stores=self.store_dict,
+                labels_df=test_df,
+                **dataset_kwargs,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                dataset=test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                collate_fn=self.collate_fcn,
+                sampler=test_sampler,
+            )
+
+            self.test_loader = test_loader
+
+        return

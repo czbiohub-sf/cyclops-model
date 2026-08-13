@@ -1,0 +1,76 @@
+# Example DINOv3 feature-extraction config.
+#
+# Run from the monorepo root:
+#   uv run python cyclops_model/src/cyclops_model/models/dinov3.py \
+#       --config_path cyclops_model/experiments/embedding/configs/dinov3/example.yml
+#
+# Paths may reference environment variables ($OPS_BASE_PATH below). They are
+# expanded when the config is loaded; an unset variable is an error rather than a
+# literal directory of that name.
+
+model_type: dinov3
+dataset_type: basic
+
+data_manager:
+  experiments:
+    ops0031_20250424:       # experiment name -> list of positions (well/fov/z)
+      - A/1/0
+      - A/2/0
+      - A/3/0
+  batch_size: 256
+  data_split:               # train/val/test split; inference reads everything as test
+    - 0
+    - 0
+    - 1
+  out_channels:             # one SLURM job is submitted per (config, channel) pair
+    - Phase2D
+  initial_yx_patch_size:    # crop size pulled from the store
+    - 256
+    - 256
+  final_yx_patch_size:      # size handed to the model
+    - 128
+    - 128
+  num_workers: 20
+  balanced_sampling: False
+
+output_dir: $OPS_BASE_PATH/ops0031_20250424/3-assembly/dino_features
+cell_type: 'A549'
+embedding_type: dinov3
+
+# Guide- and gene-level aggregation are controlled independently. The settings
+# below extract per-cell features only, which is the usual first pass: aggregate
+# afterwards with features/batch_process_embeddings.py.
+#
+# To aggregate here instead, set compute_embeddings: true and use the embeddings
+# block, shown fully expanded for guide_level:
+#
+#   aggregation:
+#     guide_level:
+#       enabled: true             # create the guide-level aggregation at all
+#       compute_embeddings: true  # compute PCA/UMAP/PHATE on it
+#       embeddings:
+#         pca: true               # keep true; UMAP/PHATE run on the PCA output
+#         umap: true
+#         phate: true             # expensive; often disabled at gene level
+#         n_pca_components: 128
+#         n_neighbors: 15         # for UMAP/PHATE
+#       save_output: true         # write the h5ad
+#       plot_umap: false          # also render a UMAP plot
+#     gene_level:
+#       enabled: false            # skip gene level entirely
+aggregation:
+  guide_level:
+    compute_embeddings: false
+  gene_level:
+    compute_embeddings: false
+
+batch_processing:
+  force_reprocess: true
+
+slurm:
+  partition: gpu
+  gres: gpu:1
+  cpus_per_task: 20
+  mem: 36G
+  time: "4:00:00"
+  constraint: "h100|h200|a100|a40"

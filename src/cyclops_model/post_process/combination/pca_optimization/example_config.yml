@@ -1,0 +1,48 @@
+# Example config for the pca_optimization combination pipeline.
+#
+# Run with:
+#   python -m cyclops_model.post_process.combination.pca_optimization \
+#       --config <this file> \
+#       --signal Phase=/data/runA/phase.h5ad \
+#       --signal MAP4=/data/runA/map4.h5ad,/data/runB/map4.h5ad
+#
+# Keys are the CLI argument names as snake_case (argparse "dest" names):
+#   --cell-dino       -> cell_dino
+#   --output-dir      -> output_dir
+#   --fixed-threshold -> fixed_threshold
+# Anything omitted here falls back to the CLI default. Any flag passed on the
+# command line overrides the value here.
+# Run the module with --help for the full key list.
+#
+# NOTE: --signal is repeatable and has no sensible single-value YAML form, so
+# signal groups are always given on the command line, not in this file.
+
+# --- Feature mode (exactly ONE of: cell_dino / dino / cell_profiler / dynaclr / subcell) ---
+cell_dino: true
+
+# --- Output ---
+output_dir: /path/to/pca_optimization_output_root
+run_tag: my_run            # organizational output subfolder
+
+# --- PCA ---
+fixed_threshold: 0.80      # single variance cutoff; set 0 to run the full consensus sweep
+
+# --- Sampling ---
+target_cells: 10000000     # total pooled-cell budget per signal group
+# downsample_per_guide: true   # instead cap per sgRNA, at cells_per_guide
+# cells_per_guide: 250
+
+# --- Normalization ---
+norm_method: ntc           # ntc | global
+zscore_per_experiment: true
+
+# --- Required annotation inputs (no defaults; must point somewhere real) ---
+chad_annotation: /path/to/chad_positive_controls.yml
+ebi_annotation: /path/to/EBI_complexes.yaml
+gene_panel: /path/to/annotated_gene_panel.csv
+
+# --- Execution ---
+slurm: true                # false → run Phase 1 + Phase 2 in-process
+
+# To turn OFF a default-on flag, set it false, e.g.:
+# second_pca: false

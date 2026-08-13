@@ -1,0 +1,57 @@
+# Example Cell-DINO feature-extraction config.
+#
+# Run from the monorepo root:
+#   uv run python cyclops_model/src/cyclops_model/models/cell_dino.py \
+#       --config_path cyclops_model/experiments/embedding/configs/cell_dino/example.yml
+#
+# Paths may reference environment variables ($OPS_BASE_PATH below). They are
+# expanded when the config is loaded; an unset variable is an error rather than a
+# literal directory of that name.
+
+model_type: cell_dino
+dataset_type: basic
+
+data_manager:
+  experiments:
+    ops0031_20250424:       # experiment name -> list of positions (well/fov/z)
+      - A/1/0
+      - A/2/0
+      - A/3/0
+  batch_size: 256
+  data_split:               # train/val/test split; inference reads everything as test
+    - 0
+    - 0
+    - 1
+  out_channels:             # one SLURM job is submitted per (config, channel) pair
+    - Phase2D
+  initial_yx_patch_size:    # crop size pulled from the store
+    - 256
+    - 256
+  final_yx_patch_size:      # size handed to the model
+    - 128
+    - 128
+  num_workers: 20
+  balanced_sampling: False
+
+output_dir: $OPS_BASE_PATH/ops0031_20250424/3-assembly/cell_dino_features
+cell_type: 'A549'
+
+# Per-cell features only. Convert the CSVs to AnnData and aggregate afterwards
+# with features/batch_process_embeddings.py; see dinov3/example.yml for the full
+# set of aggregation options.
+aggregation:
+  guide_level:
+    compute_embeddings: false
+  gene_level:
+    compute_embeddings: false
+
+batch_processing:
+  force_reprocess: true     # Cell-DINO reprocesses existing outputs unconditionally
+
+slurm:
+  partition: gpu
+  gres: gpu:1
+  cpus_per_task: 20
+  mem: 36G
+  time: "4:00:00"
+  constraint: "h100|h200|a100|a40"
