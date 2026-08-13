@@ -1,0 +1,59 @@
+# Example CellProfiler feature-extraction config.
+#
+# Run from the monorepo root:
+#   uv run python cyclops_model/src/cyclops_model/models/cellprofiler/cp_features.py \
+#       --config_path cyclops_model/experiments/embedding/configs/cell-profiler/example.yml
+#
+# Unlike the DINO/SubCell models, CellProfiler writes AnnData directly (cell,
+# guide and gene level) in addition to the cell-level CSV.
+#
+# Paths may reference environment variables ($OPS_BASE_PATH below). They are
+# expanded when the config is loaded; an unset variable is an error rather than a
+# literal directory of that name.
+
+# --- Required ---------------------------------------------------------------
+data_manager:
+  experiments:
+    ops0031_20250424:       # experiment name -> list of positions (well/fov/z)
+      - A/1/0
+      - A/2/0
+      - A/3/0
+  out_channels:             # channels measured; features are named per channel
+    - Phase2D
+    - mCherry
+    - GFP
+  batch_size: 256
+  data_split:               # CellProfiler measures every cell; keep [1, 0, 0]
+    - 1
+    - 0
+    - 0
+  initial_yx_patch_size:
+    - 256
+    - 256
+  final_yx_patch_size:
+    - 128
+    - 128
+  balanced_sampling: False
+
+chunk_size: 100             # cells per CSV chunk before concatenation
+wait_for_completion: False  # True blocks until the SLURM jobs finish
+output_dir: $OPS_BASE_PATH/ops0031_20250424/3-assembly/cell-profiler
+
+# --- AnnData conversion -----------------------------------------------------
+# Applied in the SLURM job that runs after the per-chunk CSVs are concatenated.
+#
+# Cell-level output holds RAW features in original units (area in pixels,
+# intensity on its native scale), which keeps single-cell values interpretable.
+# Z-scoring happens later, per experiment, when pooling across experiments —
+# see concatenate_experiments_comprehensive() in features/anndata_utils.py and
+# its normalize_on_pooling argument.
+processing:
+  # CellProfiler-specific cleanup: drop rows with a NaN 'cell_Area'.
+  cell-profiler: true
+
+  # Maximum NaN features tolerated per cell before the cell is filtered out.
+  max_nan_features_per_cell: 0
+
+  # Rename channels to their biological reporter (e.g. 'GFP' -> 'SRRM2').
+  # Requires a single experiment in the config.
+  use_reporter_names: false
