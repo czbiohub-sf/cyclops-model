@@ -26,7 +26,7 @@ dynamic = ["version"]
 dependencies = [
     "cyclops_utils",
     "scikit-learn",
-    "torch==2.7.1",
+    "torch==2.13.0",
     "lightning",
     "byol-pytorch",
     "timm",
